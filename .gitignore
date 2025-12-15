@@ -1,0 +1,25 @@
+# XAD cloned repository
+xad/
+
+# Build artifacts
+build/
+*.exe
+*.obj
+*.o
+*.pdb
+*.ilk
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+venv/
+
+# IDE
+.vs/
+.idea/
+*.user
+
+# OS
+.DS_Store
+Thumbs.db
