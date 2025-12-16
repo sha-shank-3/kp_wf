@@ -216,11 +216,16 @@ T priceSinglePathXAD(T S0, T T_mat, T r, T sigma, double K, double z, bool isCal
 }
 
 // =============================================================================
-// XAD Greeks (Per-Path Tape Pattern)
+// XAD Greeks (OPTIMIZED: Single Tape for ALL paths - Batched Recording)
 // =============================================================================
+// XAD Greeks - Per-Path Tape with Reuse (Correct MC Pattern)
+// =============================================================================
+// For Monte Carlo, we must compute adjoints per-path because each path has
+// different random numbers. We reuse the tape to minimize allocation overhead.
 
 GreeksResult computeGreeksXAD(const OptionParams& opt, const std::vector<double>& Z) {
     size_t nPaths = Z.size();
+    double n = static_cast<double>(nPaths);
     
     // Accumulators
     double accPrice = 0.0;
@@ -229,10 +234,11 @@ GreeksResult computeGreeksXAD(const OptionParams& opt, const std::vector<double>
     double accTheta = 0.0;
     double accRho = 0.0;
     
-    // Process each path with its own tape
+    // Create ONE tape and reuse it across paths
+    tape_type tape;
+    
+    // Process each path
     for (size_t i = 0; i < nPaths; ++i) {
-        tape_type tape;
-        
         // Create active variables
         AReal S0_ad = opt.S0;
         AReal T_ad = opt.T;
@@ -262,64 +268,46 @@ GreeksResult computeGreeksXAD(const OptionParams& opt, const std::vector<double>
         accTheta += derivative(T_ad);
         accRho += derivative(r_ad);
         accVega += derivative(sigma_ad);
+        
+        // Clear tape for next path (keeps memory allocated - key optimization!)
+        tape.clearAll();
     }
     
     GreeksResult result;
-    double n = static_cast<double>(nPaths);
-    
     result.price = accPrice / n;
     result.delta = accDelta / n;
     result.vega = accVega / n;
     result.rho = accRho / n;
-    
-    // Convert theta: dV/dT → daily P&L (as time passes, T decreases)
     result.theta = -(accTheta / n) / 365.0;
     
-    // Gamma via finite difference on delta (requires 2 more XAD runs)
+    // Gamma via FD on delta
     double dS = opt.S0 * 0.01;
     
-    OptionParams opt_up = opt, opt_down = opt;
-    opt_up.S0 = opt.S0 + dS;
-    opt_down.S0 = opt.S0 - dS;
+    auto computeDelta = [&](double S0_bumped) -> double {
+        double accD = 0.0;
+        for (size_t i = 0; i < nPaths; ++i) {
+            AReal S0_ad = S0_bumped;
+            tape.registerInput(S0_ad);
+            tape.newRecording();
+            AReal T_ad = opt.T, r_ad = opt.r, sigma_ad = opt.sigma;
+            AReal payoff = priceSinglePathXAD(S0_ad, T_ad, r_ad, sigma_ad, opt.K, Z[i], opt.isCall);
+            tape.registerOutput(payoff);
+            derivative(payoff) = 1.0;
+            tape.computeAdjoints();
+            accD += derivative(S0_ad);
+            tape.clearAll();
+        }
+        return accD / n;
+    };
     
-    // Delta up
-    double deltaUp = 0.0;
-    for (size_t i = 0; i < nPaths; ++i) {
-        tape_type tape;
-        AReal S0_ad = opt_up.S0;
-        tape.registerInput(S0_ad);
-        tape.newRecording();
-        AReal T_ad = opt.T, r_ad = opt.r, sigma_ad = opt.sigma;
-        AReal payoff = priceSinglePathXAD(S0_ad, T_ad, r_ad, sigma_ad, opt.K, Z[i], opt.isCall);
-        tape.registerOutput(payoff);
-        derivative(payoff) = 1.0;
-        tape.computeAdjoints();
-        deltaUp += derivative(S0_ad);
-    }
-    deltaUp /= n;
-    
-    // Delta down
-    double deltaDown = 0.0;
-    for (size_t i = 0; i < nPaths; ++i) {
-        tape_type tape;
-        AReal S0_ad = opt_down.S0;
-        tape.registerInput(S0_ad);
-        tape.newRecording();
-        AReal T_ad = opt.T, r_ad = opt.r, sigma_ad = opt.sigma;
-        AReal payoff = priceSinglePathXAD(S0_ad, T_ad, r_ad, sigma_ad, opt.K, Z[i], opt.isCall);
-        tape.registerOutput(payoff);
-        derivative(payoff) = 1.0;
-        tape.computeAdjoints();
-        deltaDown += derivative(S0_ad);
-    }
-    deltaDown /= n;
-    
-    result.gamma = (deltaUp - deltaDown) / (2.0 * dS);
+    result.gamma = (computeDelta(opt.S0 + dS) - computeDelta(opt.S0 - dS)) / (2.0 * dS);
     
     return result;
 }
 
 // =============================================================================
+// Timing Helper
+// =============================================================================// =============================================================================
 // Timing Helper
 // =============================================================================
 
@@ -369,7 +357,7 @@ int main() {
     opt.sigma = 0.20;
     opt.isCall = true;
     
-    size_t nPaths = 100000;  // More paths for C++ (faster)
+    size_t nPaths = 10000;  // Reduced for fair AAD comparison
     unsigned int seed = 42;
     
     std::cout << "\nOption Parameters:\n";
@@ -468,11 +456,16 @@ int main() {
     std::cout << "    XAD: 3 simulations x " << nPaths << " paths = " << 3 * nPaths << " path evaluations\n";
     std::cout << "         (1 base gives Delta,Vega,Theta,Rho + 2 for Gamma)\n";
     
-    std::cout << "\n  When XAD excels (scaling advantages):\n";
-    std::cout << "    - For 100+ Greeks (curve nodes), XAD scales O(1) vs FD O(n)\n";
-    std::cout << "    - Exact derivatives (no bump size selection)\n";
-    std::cout << "    - All first-order sensitivities in one backward pass\n";
-    std::cout << "    - Complex path-dependent payoffs\n";
+    std::cout << "\n  WHY FD IS FASTER HERE:\n";
+    std::cout << "    - Simple model with only 4 inputs (S0, T, r, sigma)\n";
+    std::cout << "    - FD uses vectorized loops (no tape overhead)\n";
+    std::cout << "    - AAD tape records every operation (memory + compute overhead)\n";
+    
+    std::cout << "\n  WHEN AAD EXCELS:\n";
+    std::cout << "    - 100+ inputs (e.g., yield curve nodes) -> O(1) vs O(n) for FD\n";
+    std::cout << "    - See Hull-White swaption example: 10+ curve sensitivities in one pass\n";
+    std::cout << "    - Complex path-dependent payoffs where FD bumps are expensive\n";
+    std::cout << "    - Exact derivatives (no bump size tuning)\n";
     
     std::cout << "\n" << std::string(80, '=') << "\n";
     std::cout << "Analysis Complete\n";
