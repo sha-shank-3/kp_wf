@@ -8,8 +8,8 @@ This script demonstrates:
 3. Greeks calculation using Finite Differences
 4. Timing comparison between XAD and FD approaches
 
-For pathwise AAD to work with discontinuous payoffs,
-we use soft-max approximation: max(x,0) ≈ (x + sqrt(x² + ε²)) / 2
+Key: Each MC path uses its own tape, with adjoints computed per-path
+and accumulated across all paths (following the swaption pattern).
 """
 
 import numpy as np
@@ -38,7 +38,7 @@ def monte_carlo_european_option(
     r: float,
     sigma: float,
     is_call: bool = True,
-    n_paths: int = 100000,
+    n_paths: int = 10000,
     seed: int = 42
 ) -> float:
     """
@@ -70,39 +70,41 @@ def compute_greeks_fd(
     r: float,
     sigma: float,
     is_call: bool = True,
-    n_paths: int = 100000,
+    n_paths: int = 10000,
     seed: int = 42
 ) -> Dict[str, float]:
     """
     Compute Greeks using central finite differences.
+    Each Greek requires 2 additional MC simulations (up and down bump).
+    Total: 9 MC simulations for 5 Greeks (using base for Gamma center).
     """
     dS = S0 * 0.01
     dsigma = 0.01
     dT = 1/365
     dr = 0.0001
     
+    # Base price
     V0 = monte_carlo_european_option(S0, K, T, r, sigma, is_call, n_paths, seed)
     
-    # Delta and Gamma
+    # Delta and Gamma (2 simulations)
     V_up = monte_carlo_european_option(S0 + dS, K, T, r, sigma, is_call, n_paths, seed)
     V_down = monte_carlo_european_option(S0 - dS, K, T, r, sigma, is_call, n_paths, seed)
     delta = (V_up - V_down) / (2 * dS)
     gamma = (V_up - 2*V0 + V_down) / (dS**2)
     
-    # Vega
+    # Vega (2 simulations)
     V_sigma_up = monte_carlo_european_option(S0, K, T, r, sigma + dsigma, is_call, n_paths, seed)
     V_sigma_down = monte_carlo_european_option(S0, K, T, r, sigma - dsigma, is_call, n_paths, seed)
     vega = (V_sigma_up - V_sigma_down) / (2 * dsigma)
     
-    # Theta: (V(T-dt) - V(T)) is the change when one day passes
-    # Theta is typically expressed as daily P&L, so we DON'T divide by dT
+    # Theta (1 simulation - forward difference)
     if T > dT:
         V_T_down = monte_carlo_european_option(S0, K, T - dT, r, sigma, is_call, n_paths, seed)
-        theta = V_T_down - V0  # Change in value when 1 day passes
+        theta = V_T_down - V0  # Daily P&L as time passes
     else:
         theta = 0.0
     
-    # Rho
+    # Rho (2 simulations)
     V_r_up = monte_carlo_european_option(S0, K, T, r + dr, sigma, is_call, n_paths, seed)
     V_r_down = monte_carlo_european_option(S0, K, T, r - dr, sigma, is_call, n_paths, seed)
     rho = (V_r_up - V_r_down) / (2 * dr)
@@ -118,8 +120,46 @@ def compute_greeks_fd(
 
 
 # =============================================================================
-# XAD (AAD) Greeks - Using Soft-Max Approximation
+# XAD (AAD) Greeks - Per-Path Tape Pattern
 # =============================================================================
+
+def price_single_path_xad(
+    S0_ad,      # XAD active Real
+    T_ad,       # XAD active Real  
+    r_ad,       # XAD active Real
+    sigma_ad,   # XAD active Real
+    K: float,
+    z: float,   # Single random number for this path
+    is_call: bool,
+    smoothing: float = 0.001
+):
+    """
+    Price a single path using XAD active types.
+    Returns discounted payoff as XAD Real.
+    
+    Uses soft-max approximation: max(x,0) ≈ (x + sqrt(x² + ε²)) / 2
+    """
+    eps = smoothing * K
+    
+    # GBM simulation
+    drift = (r_ad - sigma_ad * sigma_ad * 0.5) * T_ad
+    sqrt_T = xmath.sqrt(T_ad)
+    S_T = S0_ad * xmath.exp(drift + sigma_ad * sqrt_T * z)
+    
+    # Payoff with soft-max
+    if is_call:
+        x = S_T - K
+    else:
+        x = K - S_T
+    
+    # Smooth max approximation for differentiability
+    payoff = (x + xmath.sqrt(x * x + eps * eps)) * 0.5
+    
+    # Discount
+    discount = xmath.exp(-r_ad * T_ad)
+    
+    return discount * payoff
+
 
 def compute_greeks_xad(
     S0: float,
@@ -128,83 +168,78 @@ def compute_greeks_xad(
     r: float,
     sigma: float,
     is_call: bool = True,
-    n_paths: int = 20000,
+    n_paths: int = 10000,
     seed: int = 42,
     smoothing: float = 0.001
 ) -> Dict[str, float]:
     """
-    Compute all Greeks in a single Monte Carlo simulation using XAD AAD.
+    Compute Greeks using XAD AAD with per-path tape pattern.
     
-    Uses soft-max approximation for differentiability:
-    max(x, 0) ≈ (x + sqrt(x² + ε²)) / 2
+    For each path:
+    1. Create a new tape
+    2. Create fresh active variables
+    3. Register inputs, compute price, compute adjoints
+    4. Accumulate derivatives
     
-    This computes Delta, Vega, Theta, Rho in ONE backward pass.
-    Gamma requires FD on Delta (2 additional simulations).
+    This gives us Delta, Vega, Theta, Rho in n_paths forward+backward passes.
+    Gamma requires FD on Delta (2 additional full computations).
     """
     if not XAD_AVAILABLE:
         raise ImportError("XAD library not available")
     
     np.random.seed(seed)
     Z = np.random.standard_normal(n_paths)
-    eps = smoothing * K
     
-    # Create tape and activate
-    tape = xadj.Tape()
-    tape.activate()
+    # Accumulators for price and Greeks
+    acc_price = 0.0
+    acc_delta = 0.0
+    acc_vega = 0.0
+    acc_theta = 0.0  # dV/dT
+    acc_rho = 0.0
     
-    # Create active variables for all inputs we want sensitivities to
-    S0_ad = xadj.Real(S0)
-    T_ad = xadj.Real(T)
-    r_ad = xadj.Real(r)
-    sigma_ad = xadj.Real(sigma)
+    # Process each path with its own tape
+    for path_idx in range(n_paths):
+        with xadj.Tape() as tape:
+            # Create fresh active variables for this path
+            S0_ad = xadj.Real(S0)
+            T_ad = xadj.Real(T)
+            r_ad = xadj.Real(r)
+            sigma_ad = xadj.Real(sigma)
+            
+            # Register all inputs
+            tape.registerInput(S0_ad)
+            tape.registerInput(T_ad)
+            tape.registerInput(r_ad)
+            tape.registerInput(sigma_ad)
+            
+            # Start recording operations
+            tape.newRecording()
+            
+            # Compute discounted payoff for this path
+            payoff = price_single_path_xad(
+                S0_ad, T_ad, r_ad, sigma_ad, K, Z[path_idx], is_call, smoothing
+            )
+            
+            # Register output and compute adjoints
+            tape.registerOutput(payoff)
+            payoff.derivative = 1.0
+            tape.computeAdjoints()
+            
+            # Accumulate
+            acc_price += payoff.value
+            acc_delta += S0_ad.derivative
+            acc_vega += sigma_ad.derivative
+            acc_theta += T_ad.derivative
+            acc_rho += r_ad.derivative
     
-    # Register inputs BEFORE calling newRecording
-    tape.registerInput(S0_ad)
-    tape.registerInput(T_ad)
-    tape.registerInput(r_ad)
-    tape.registerInput(sigma_ad)
+    # Average across paths
+    price = acc_price / n_paths
+    delta = acc_delta / n_paths
+    vega = acc_vega / n_paths
+    theta_dT = acc_theta / n_paths
+    rho = acc_rho / n_paths
     
-    # Start recording operations
-    tape.newRecording()
-    
-    # Pre-compute common terms
-    drift = (r_ad - sigma_ad * sigma_ad * 0.5) * T_ad
-    sqrt_T = xmath.sqrt(T_ad)
-    
-    # Accumulate payoffs over all paths
-    total_payoff = xadj.Real(0.0)
-    
-    for z in Z:
-        S_T = S0_ad * xmath.exp(drift + sigma_ad * sqrt_T * z)
-        
-        if is_call:
-            x = S_T - K
-        else:
-            x = K - S_T
-        
-        # Smooth max approximation
-        payoff = (x + xmath.sqrt(x * x + eps * eps)) * 0.5
-        total_payoff = total_payoff + payoff
-    
-    # Discount and average
-    discount = xmath.exp(-r_ad * T_ad)
-    price = discount * total_payoff / n_paths
-    
-    # Register output and compute adjoints (backward pass)
-    tape.registerOutput(price)
-    price.derivative = 1.0
-    tape.computeAdjoints()
-    
-    # Extract Greeks
-    price_val = price.value
-    delta = S0_ad.derivative
-    vega = sigma_ad.derivative
-    theta_dT = T_ad.derivative  # dV/dT
-    rho = r_ad.derivative
-    
-    tape.deactivate()
-    
-    # Theta: as time passes, T decreases, so theta = dV/dT * (-1/365)
+    # Convert theta: dV/dT → daily P&L (as time passes, T decreases)
     theta = -theta_dT / 365
     
     # Gamma via finite difference on delta
@@ -214,7 +249,7 @@ def compute_greeks_xad(
     gamma = (delta_up - delta_down) / (2 * dS)
     
     return {
-        'price': price_val,
+        'price': price,
         'delta': delta,
         'gamma': gamma,
         'vega': vega,
@@ -230,56 +265,40 @@ def compute_delta_xad(
     r: float,
     sigma: float,
     is_call: bool = True,
-    n_paths: int = 20000,
+    n_paths: int = 10000,
     seed: int = 42,
     smoothing: float = 0.001
 ) -> float:
-    """Compute only delta for gamma calculation."""
+    """Compute only delta for gamma calculation (per-path tape pattern)."""
     if not XAD_AVAILABLE:
         return 0.0
     
     np.random.seed(seed)
     Z = np.random.standard_normal(n_paths)
-    eps = smoothing * K
     
-    tape = xadj.Tape()
-    tape.activate()
+    acc_delta = 0.0
     
-    S0_ad = xadj.Real(S0)
-    T_ad = xadj.Real(T)
-    r_ad = xadj.Real(r)
-    sigma_ad = xadj.Real(sigma)
+    for path_idx in range(n_paths):
+        with xadj.Tape() as tape:
+            S0_ad = xadj.Real(S0)
+            T_ad = xadj.Real(T)
+            r_ad = xadj.Real(r)
+            sigma_ad = xadj.Real(sigma)
+            
+            tape.registerInput(S0_ad)
+            tape.newRecording()
+            
+            payoff = price_single_path_xad(
+                S0_ad, T_ad, r_ad, sigma_ad, K, Z[path_idx], is_call, smoothing
+            )
+            
+            tape.registerOutput(payoff)
+            payoff.derivative = 1.0
+            tape.computeAdjoints()
+            
+            acc_delta += S0_ad.derivative
     
-    tape.registerInput(S0_ad)
-    tape.newRecording()
-    
-    drift = (r_ad - sigma_ad * sigma_ad * 0.5) * T_ad
-    sqrt_T = xmath.sqrt(T_ad)
-    
-    total_payoff = xadj.Real(0.0)
-    
-    for z in Z:
-        S_T = S0_ad * xmath.exp(drift + sigma_ad * sqrt_T * z)
-        
-        if is_call:
-            x = S_T - K
-        else:
-            x = K - S_T
-        
-        payoff = (x + xmath.sqrt(x * x + eps * eps)) * 0.5
-        total_payoff = total_payoff + payoff
-    
-    discount = xmath.exp(-r_ad * T_ad)
-    price = discount * total_payoff / n_paths
-    
-    tape.registerOutput(price)
-    price.derivative = 1.0
-    tape.computeAdjoints()
-    
-    delta = S0_ad.derivative
-    tape.deactivate()
-    
-    return delta
+    return acc_delta / n_paths
 
 
 # =============================================================================
@@ -349,8 +368,7 @@ def run_comparison():
     r = 0.05
     sigma = 0.20
     is_call = True
-    n_paths_fd = 50000
-    n_paths_xad = 20000  # Smaller for XAD due to tape memory
+    n_paths = 10000   # MC paths for both methods
     seed = 42
     
     print(f"\nOption Parameters:")
@@ -360,8 +378,7 @@ def run_comparison():
     print(f"  Rate (r):      {r*100:.2f}%")
     print(f"  Volatility:    {sigma*100:.2f}%")
     print(f"  Option Type:   {'Call' if is_call else 'Put'}")
-    print(f"  FD MC Paths:   {n_paths_fd:,}")
-    print(f"  XAD MC Paths:  {n_paths_xad:,}")
+    print(f"  MC Paths:      {n_paths:,}")
     
     # Analytical Solution
     print("\n" + "-" * 80)
@@ -388,7 +405,7 @@ def run_comparison():
     print("-" * 80)
     
     start_time = time.time()
-    fd_results = compute_greeks_fd(S0, K, T, r, sigma, is_call, n_paths_fd, seed)
+    fd_results = compute_greeks_fd(S0, K, T, r, sigma, is_call, n_paths, seed)
     fd_time = time.time() - start_time
     
     print(f"  Price:  ${fd_results['price']:.4f}")
@@ -398,16 +415,16 @@ def run_comparison():
     print(f"  Theta:  ${fd_results['theta']:.4f}/day")
     print(f"  Rho:     {fd_results['rho']:.4f}")
     print(f"\n  Time:    {fd_time:.4f} seconds")
-    print(f"  MC runs: 9 (base + 2 per Greek)")
+    print(f"  MC runs: 9 simulations × {n_paths:,} paths each")
     
     # XAD AAD
     if XAD_AVAILABLE:
         print("\n" + "-" * 80)
-        print("XAD Adjoint Algorithmic Differentiation")
+        print("XAD Adjoint Algorithmic Differentiation (Per-Path Tape)")
         print("-" * 80)
         
         start_time = time.time()
-        xad_results = compute_greeks_xad(S0, K, T, r, sigma, is_call, n_paths_xad, seed)
+        xad_results = compute_greeks_xad(S0, K, T, r, sigma, is_call, n_paths, seed)
         xad_time = time.time() - start_time
         
         print(f"  Price:  ${xad_results['price']:.4f}")
@@ -417,7 +434,7 @@ def run_comparison():
         print(f"  Theta:  ${xad_results['theta']:.4f}/day")
         print(f"  Rho:     {xad_results['rho']:.4f}")
         print(f"\n  Time:    {xad_time:.4f} seconds")
-        print(f"  MC runs: 3 (1 base with 4 Greeks + 2 for gamma)")
+        print(f"  MC runs: 3 simulations × {n_paths:,} paths (1 base + 2 for gamma)")
     else:
         xad_results = None
         xad_time = None
@@ -454,23 +471,26 @@ def run_comparison():
     print("TIMING ANALYSIS")
     print("-" * 80)
     
-    print(f"\n  Finite Differences:  {fd_time:.4f} seconds ({n_paths_fd:,} paths)")
+    print(f"\n  Finite Differences:  {fd_time:.4f} seconds")
     if xad_time:
-        print(f"  XAD AAD:             {xad_time:.4f} seconds ({n_paths_xad:,} paths)")
+        print(f"  XAD AAD:             {xad_time:.4f} seconds")
         
-        # Normalized comparison (per 10k paths)
-        fd_per_10k = fd_time / (n_paths_fd / 10000) * 9  # 9 simulations
-        xad_per_10k = xad_time / (n_paths_xad / 10000) * 3  # 3 simulations
+        if fd_time > xad_time:
+            speedup = fd_time / xad_time
+            print(f"\n  ✓ XAD is {speedup:.2f}x FASTER than Finite Differences")
+        else:
+            ratio = xad_time / fd_time
+            print(f"\n  FD is {ratio:.1f}x faster (XAD per-path tape has overhead)")
         
-        print(f"\n  Normalized (per 10k paths):")
-        print(f"    FD:  {fd_per_10k:.4f}s for 9 simulations")
-        print(f"    XAD: {xad_per_10k:.4f}s for 3 simulations")
+        print(f"\n  Computation breakdown:")
+        print(f"    FD:  9 simulations × {n_paths:,} paths = {9*n_paths:,} path evaluations")
+        print(f"    XAD: 3 simulations × {n_paths:,} paths = {3*n_paths:,} path evaluations")
+        print(f"         (1 base gives Delta,Vega,Theta,Rho + 2 for Gamma)")
         
-        print(f"\n  Key Advantages of XAD AAD:")
-        print(f"    • Computes Delta, Vega, Theta, Rho in ONE backward pass")
-        print(f"    • O(1) cost regardless of number of input sensitivities")
-        print(f"    • For 100+ Greeks (e.g., curve nodes), XAD is ~10-50x faster")
-        print(f"    • Exact derivatives (no truncation error from bump size)")
+        print(f"\n  XAD advantages for complex models:")
+        print(f"    • For 100+ Greeks (curve nodes), XAD scales O(1) vs FD O(n)")
+        print(f"    • Exact derivatives (no bump size selection)")
+        print(f"    • All first-order sensitivities in one backward pass")
     
     # Accuracy Analysis
     if has_analytical and xad_results:
@@ -492,8 +512,8 @@ def run_comparison():
         
         print("\n  Notes:")
         print("    • XAD uses soft-max approximation (small smoothing bias)")
-        print("    • FD Theta error due to discrete time step")
-        print("    • Both methods have MC sampling noise")
+        print("    • Both methods use same random numbers for fair comparison")
+        print("    • MC sampling noise is the main error source")
     
     print("\n" + "=" * 80)
     print("Analysis Complete")
