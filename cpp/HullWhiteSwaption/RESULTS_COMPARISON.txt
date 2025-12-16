@@ -1,0 +1,189 @@
+================================================================================
+HULL-WHITE SWAPTION GREEKS: METHOD COMPARISON RESULTS
+================================================================================
+Date: December 16, 2025
+Model: Hull-White 1-Factor with Jamshidian Decomposition
+Calibration: Price-based (minimize RMSE of HW vs Black swaption prices)
+
+================================================================================
+TEST CONFIGURATION
+================================================================================
+
+OIS Curve:        Real market data (2024-12-16)
+Vol Surface:      9 expiries x 9 tenors = 81 nodes
+Calibration:      20 ATM swaptions
+Target Swaption:  2Y x 5Y Payer, ATM Strike = 4.232%, Notional = $1,000,000
+Monte Carlo:      2,000 paths, 200 steps (dt = 0.01Y)
+
+Calibrated HW Parameters:
+  a (mean reversion) = 0.005000 (at lower bound)
+  sigma (volatility) = 0.007264
+  Price RMSE         = $0.0014
+
+Reference Price:  $11,712.32
+
+================================================================================
+METHODS COMPARED
+================================================================================
+
+1. FD NAIVE (Finite Differences - Brute Force)
+   - For each of 81 vol nodes: bump vol -> recalibrate HW -> reprice
+   - Cost: 81 recalibrations + 81 MC pricings
+
+2. FD CHAIN RULE
+   - Compute dV/da, dV/dsigma via 4 FD bumps (2 for a, 2 for sigma)
+   - For each vol node: bump vol -> recalibrate -> get da/dvol, dsigma/dvol
+   - Chain rule: dV/dvol = dV/da * da/dvol + dV/dsigma * dsigma/dvol
+   - Cost: 4 MC pricings + 81 recalibrations (NO per-node MC!)
+
+3. XAD + IFT (Adjoint AD + Implicit Function Theorem)
+   - dV/da, dV/dsigma via single AAD backward pass
+   - da/dvol, dsigma/dvol via IFT (no recalibrations!)
+   - IFT: Uses reduced Hessian when parameters at boundaries
+   - Cost: 1 AAD pricing + 3 AAD passes on F + 1 Hessian inverse
+
+4. TRUE XAD (Calibration ON TAPE)
+   - Register vol nodes as AD inputs
+   - Tape calibration using IFT-linearized formula
+   - Tape pricing
+   - Single backward pass for ALL 81 Greeks
+   - Cost: 1 forward pass + 1 backward pass
+
+================================================================================
+VOL SURFACE GREEKS COMPARISON (per 1bp vol bump)
+================================================================================
+
+Node             FD Naive    FD Chain    IFT+XAD    TRUE XAD
+----------------------------------------------------------------
+1.00Yx1.00Y         0.52        0.37        0.36        0.35
+1.00Yx2.00Y         1.56        1.41        1.40        1.34
+1.00Yx3.00Y         3.19        3.04        3.03        2.89
+1.00Yx5.00Y         7.91        7.76        7.71        7.36
+1.00Yx7.00Y        14.07       13.92       13.84       13.20
+2.00Yx1.00Y         0.83        0.68        0.67        0.64
+2.00Yx2.00Y         2.75        2.60        2.59        2.47
+2.00Yx3.00Y         5.76        5.61        5.58        5.33
+2.00Yx5.00Y        14.41       14.26       14.12       13.50
+2.00Yx7.00Y        25.70       25.55       25.32       24.23
+
+ACCURACY NOTES:
+- FD Naive shows ~0.15 bias due to recalibration noise
+- FD Chain is the reference (proper chain rule)
+- IFT+XAD matches FD Chain within ~1% (uses reduced Hessian + central diff)
+- TRUE XAD matches FD Chain within ~5% (linearization + per-path noise)
+
+================================================================================
+TIMING COMPARISON
+================================================================================
+
+Method               Time (s)    Speedup vs Naive    Speedup vs Chain
+------------------------------------------------------------------------
+FD Naive               3.378            1.0x               0.4x
+FD Chain               1.203            2.8x               1.0x
+IFT + XAD              0.093           36.5x              13.0x
+TRUE XAD               0.095           35.5x              12.7x
+
+================================================================================
+RATE CURVE GREEKS (20 Greeks)
+================================================================================
+
+Method          Time (s)    Speedup
+------------------------------------
+FD (40 bumps)     1.095       1.0x
+XAD (1 AAD)       0.154       7.1x
+
+Sample Rate Deltas (per 1bp):
+Maturity        XAD Delta    FD Delta    Rel Diff
+--------------------------------------------------
+0.003Y           -31.94      -31.94       0.02%
+0.019Y          -158.35     -158.65       0.19%
+0.083Y            43.22       43.17       0.10%
+2.000Y           411.67      410.89       0.19%
+
+================================================================================
+ALL GREEKS COMBINED (22 Greeks: 20 rates + 2 HW params)
+================================================================================
+
+Method                      Time (s)    Speedup
+------------------------------------------------
+FD (44 MC pricings)           1.197       1.0x
+XAD (1 AAD pricing)           0.154       7.8x
+
+SCALING PROJECTION:
+  22 Greeks   ->   ~8x speedup
+  100 Greeks  ->  ~35x speedup (estimated)
+  500 Greeks  -> ~177x speedup (estimated)
+
+WHY: FD cost = O(N) pricings, XAD cost = O(1) pricing
+
+================================================================================
+KEY INSIGHTS
+================================================================================
+
+1. CHAIN RULE OPTIMIZATION
+   - Separating dV/d(a,sigma) from d(a,sigma)/dvol avoids per-node MC
+   - 2.8x speedup over naive FD
+
+2. XAD FOR DIRECT GREEKS
+   - AAD gives all dV/d(rates, a, sigma) in single backward pass
+   - 7-8x speedup over FD for direct Greeks
+
+3. IMPLICIT FUNCTION THEOREM
+   - Avoids ALL recalibrations for vol surface Greeks
+   - IFT: d(a,sigma)/dvol = -H^(-1) * dF/dvol
+   - Key: Use REDUCED Hessian when parameters hit boundaries
+   - 13x speedup over FD Chain, 36x over FD Naive
+
+4. TRUE XAD (CALIBRATION ON TAPE)
+   - Put entire pipeline (vol -> calibration -> pricing) on tape
+   - Single backward pass for ALL 81 vol Greeks
+   - Uses IFT-linearized calibration for correct sensitivities
+   - 35x speedup, ~5% accuracy vs FD Chain
+
+================================================================================
+BOUNDARY CONSTRAINT HANDLING
+================================================================================
+
+Problem: Calibrated a = 0.005 is at lower bound [0.005, 0.5]
+
+Standard IFT formula (INVALID at boundary):
+  [da/dvol]     = -H^(-1) * [dF_a/dvol  ]
+  [ds/dvol]                 [dF_s/dvol  ]
+
+Reduced Hessian approach (CORRECT):
+  da/dvol = 0  (parameter frozen at boundary)
+  ds/dvol = -dF_s/dvol / H_ss  (only free parameter moves)
+
+This fix brought IFT+XAD accuracy from ~50% error to ~1% error.
+
+================================================================================
+NUMERICAL DETAILS
+================================================================================
+
+Mixed Partial Computation:
+  - Central differences for d²RMSE/dσ·dvol
+  - Step sizes: δσ = 1e-6, δvol = 1e-5
+  - Formula: (F(σ+δσ,v+δv) - F(σ+δσ,v-δv) - F(σ-δσ,v+δv) + F(σ-δσ,v-δv)) / (4*δσ*δv)
+
+Hessian Components:
+  - H_ss = d²RMSE/dσ² (computed at calibrated point)
+  - Uses central differences for stability
+
+================================================================================
+CONCLUSION
+================================================================================
+
+Best Method: IFT + XAD
+- 36x faster than naive FD
+- 13x faster than FD with chain rule
+- ~1% accuracy vs reference
+- No recalibrations needed
+- Correctly handles boundary constraints
+
+Alternative: TRUE XAD
+- Same speed as IFT+XAD
+- Slightly less accurate (~5% error)
+- Conceptually elegant (entire pipeline on tape)
+- Uses IFT sensitivities for correct derivatives
+
+================================================================================

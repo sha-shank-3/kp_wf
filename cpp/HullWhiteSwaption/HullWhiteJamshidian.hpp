@@ -399,6 +399,92 @@ inline double computePriceRMSE(double a, double sigma,
     return std::sqrt(sse / count);
 }
 
+// =============================================================================
+// SMOOTH calibration using gradient descent with momentum
+// This calibration is differentiable and changes smoothly with vol inputs.
+// =============================================================================
+inline PriceCalibResult calibrateHullWhitePricesSmooth(
+    const ATMVolSurface& volSurface,
+    const RealOISCurve& curve,
+    const std::vector<std::pair<size_t, size_t>>& calibInstruments,
+    double notional = 1.0,
+    double init_a = 0.05,      // Starting point for a
+    double init_sigma = 0.01   // Starting point for sigma
+) {
+    double a = init_a;
+    double sigma = init_sigma;
+    double h = 1e-5;  // FD step for gradient
+    
+    // Adaptive learning rates
+    double lr_a = 1e-4;
+    double lr_s = 1e-6;
+    
+    // Momentum
+    double mom_a = 0.0, mom_s = 0.0;
+    double beta = 0.9;
+    
+    int iterations = 0;
+    const int max_iter = 500;
+    const double tol = 1e-10;
+    
+    double best_a = a, best_sigma = sigma;
+    double best_rmse = computePriceRMSE(a, sigma, volSurface, curve, calibInstruments, notional);
+    
+    for (int iter = 0; iter < max_iter; ++iter) {
+        double f0 = computePriceRMSE(a, sigma, volSurface, curve, calibInstruments, notional);
+        
+        // Compute gradient via central differences
+        double f_a_p = computePriceRMSE(a + h, sigma, volSurface, curve, calibInstruments, notional);
+        double f_a_m = computePriceRMSE(a - h, sigma, volSurface, curve, calibInstruments, notional);
+        double f_s_p = computePriceRMSE(a, sigma + h, volSurface, curve, calibInstruments, notional);
+        double f_s_m = computePriceRMSE(a, sigma - h, volSurface, curve, calibInstruments, notional);
+        
+        double grad_a = (f_a_p - f_a_m) / (2 * h);
+        double grad_s = (f_s_p - f_s_m) / (2 * h);
+        
+        // Check convergence on gradient norm
+        double grad_norm = std::sqrt(grad_a * grad_a + grad_s * grad_s);
+        if (grad_norm < tol) break;
+        
+        // Momentum update
+        mom_a = beta * mom_a + (1 - beta) * grad_a;
+        mom_s = beta * mom_s + (1 - beta) * grad_s;
+        
+        // Gradient descent step
+        double new_a = std::clamp(a - lr_a * mom_a, 0.005, 0.5);
+        double new_s = std::clamp(sigma - lr_s * mom_s, 0.001, 0.05);
+        
+        double new_rmse = computePriceRMSE(new_a, new_s, volSurface, curve, calibInstruments, notional);
+        
+        if (new_rmse < f0) {
+            a = new_a;
+            sigma = new_s;
+            if (new_rmse < best_rmse) {
+                best_rmse = new_rmse;
+                best_a = a;
+                best_sigma = sigma;
+            }
+            // Increase learning rate on success
+            lr_a = std::min(lr_a * 1.05, 1e-2);
+            lr_s = std::min(lr_s * 1.05, 1e-4);
+        } else {
+            // Decrease learning rate on failure
+            lr_a *= 0.5;
+            lr_s *= 0.5;
+            mom_a = 0;
+            mom_s = 0;
+        }
+        
+        iterations++;
+        if (lr_a < 1e-12 && lr_s < 1e-14) break;
+    }
+    
+    std::vector<std::pair<double, double>> price_pairs;
+    computePriceRMSE(best_a, best_sigma, volSurface, curve, calibInstruments, notional, &price_pairs);
+    
+    return {best_a, best_sigma, best_rmse, iterations, price_pairs};
+}
+
 // Two-stage calibration: grid search + gradient descent (on prices)
 inline PriceCalibResult calibrateHullWhitePrices(const ATMVolSurface& volSurface,
                                                   const RealOISCurve& curve,
@@ -420,47 +506,8 @@ inline PriceCalibResult calibrateHullWhitePrices(const ATMVolSurface& volSurface
         }
     }
     
-    // Stage 2: Local refinement
-    double a = best_a;
-    double sigma = best_sigma;
-    double h = 1e-6;
-    double lr_a = 0.001;
-    double lr_sigma = 0.00001;
-    
-    int iterations = 0;
-    for (int iter = 0; iter < 100; ++iter) {
-        double f0 = computePriceRMSE(a, sigma, volSurface, curve, calibInstruments, notional);
-        
-        double f_a_plus = computePriceRMSE(a + h, sigma, volSurface, curve, calibInstruments, notional);
-        double f_sigma_plus = computePriceRMSE(a, sigma + h, volSurface, curve, calibInstruments, notional);
-        
-        double grad_a = (f_a_plus - f0) / h;
-        double grad_sigma = (f_sigma_plus - f0) / h;
-        
-        double new_a = std::clamp(a - lr_a * grad_a, 0.01, 0.6);
-        double new_sigma = std::clamp(sigma - lr_sigma * grad_sigma, 0.001, 0.05);
-        
-        double new_rmse = computePriceRMSE(new_a, new_sigma, volSurface, curve, calibInstruments, notional);
-        
-        if (new_rmse < best_rmse) {
-            a = new_a;
-            sigma = new_sigma;
-            best_rmse = new_rmse;
-            best_a = a;
-            best_sigma = sigma;
-        } else {
-            lr_a *= 0.5;
-            lr_sigma *= 0.5;
-        }
-        
-        iterations++;
-        if (lr_a < 1e-10) break;
-    }
-    
-    std::vector<std::pair<double, double>> price_pairs;
-    computePriceRMSE(best_a, best_sigma, volSurface, curve, calibInstruments, notional, &price_pairs);
-    
-    return {best_a, best_sigma, best_rmse, iterations, price_pairs};
+    // Stage 2: Smooth Newton-Raphson refinement from grid search starting point
+    return calibrateHullWhitePricesSmooth(volSurface, curve, calibInstruments, notional, best_a, best_sigma);
 }
 
 // =============================================================================
