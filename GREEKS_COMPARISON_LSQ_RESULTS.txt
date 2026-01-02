@@ -1,0 +1,14 @@
+GREEKS COMPARISON RESULTS (LEAST-SQUARES CALIBRATION)
+=====================================================
+
+Configuration:
+  Calibration instruments: 81 (full vol surface)
+  HW parameters: 10
+  Over-determined ratio: 8.1x
+  Calibration RMSE: $2170.67
+
+Timing Summary:
+FD Naive:      59.1779s
+FD + Chain:    62.7222s (speedup: 0.943492x)
+FD + IFT:      1.03285s (speedup: 57.2958x)
+XAD + IFT:     0.164106s (speedup: 360.609x)

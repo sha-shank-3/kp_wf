@@ -1,0 +1,297 @@
+================================================================================
+           REQUIREMENTS FOR IMPLEMENTING ADJOINT AUTOMATIC DIFFERENTIATION 
+                         (AAD) LIBRARY FROM SCRATCH
+================================================================================
+
+Based on analysis of XAD (Xcelerit Automatic Differentiation) Library
+
+--------------------------------------------------------------------------------
+1. CORE MATHEMATICAL CONCEPTS TO UNDERSTAND
+--------------------------------------------------------------------------------
+
+1.1 Chain Rule
+    - Foundation of all AD: d(f(g(x)))/dx = f'(g(x)) * g'(x)
+    - Must propagate derivatives through nested function compositions
+
+1.2 Forward Mode vs Adjoint (Reverse) Mode
+    - Forward Mode: Computes derivatives alongside function values (input→output)
+      * Efficient when: few inputs, many outputs
+      * Complexity: O(n) for n inputs
+    
+    - Adjoint Mode: Records operations, then propagates backwards (output→input)
+      * Efficient when: many inputs, few outputs (typical in finance/ML)
+      * Complexity: O(m) for m outputs
+      * For 1 output and 100 inputs: ~100x faster than forward mode
+
+1.3 Derivative Rules for All Operations
+    - Addition: d(a+b)/da = 1, d(a+b)/db = 1
+    - Multiplication: d(a*b)/da = b, d(a*b)/db = a
+    - Division: d(a/b)/da = 1/b, d(a/b)/db = -a/b²
+    - All elementary functions: sin, cos, tan, exp, log, sqrt, pow, etc.
+
+--------------------------------------------------------------------------------
+2. CORE DATA STRUCTURES
+--------------------------------------------------------------------------------
+
+2.1 The Tape (Essential for Adjoint Mode)
+    - Records all operations during forward computation
+    - Stores: (operation_type, multiplier, input_slot, output_slot)
+    - During backward pass: replays operations in reverse to propagate adjoints
+    
+    Key components:
+    - Statement list: tracks which operations produced each output
+    - Operations container: stores (derivative_multiplier, input_slot) pairs
+    - Derivatives array: stores adjoint values for each variable
+    - Checkpoints: for memory management in long computations
+
+2.2 Active Types (AD-enabled Numbers)
+    - Replace 'double' with custom type that tracks derivatives
+    
+    AReal (Adjoint Real):
+    - Stores: value, tape_slot_index, pointer_to_tape
+    - Registers itself with tape on creation
+    
+    FReal (Forward Real):
+    - Stores: value, derivative (tangent)
+    - No tape needed - carries derivative forward inline
+
+2.3 Memory-Efficient Storage (ChunkContainer)
+    - Allocate memory in large chunks (e.g., 8MB) to avoid reallocations
+    - Use aligned memory (128-byte) for cache efficiency
+    - Implement slot reuse when variables go out of scope
+
+--------------------------------------------------------------------------------
+3. EXPRESSION TEMPLATES (Performance Optimization)
+--------------------------------------------------------------------------------
+
+3.1 Purpose
+    - Eliminate temporary objects in expressions like: a + b * c - d
+    - Use Curiously Recurring Template Pattern (CRTP) for compile-time polymorphism
+
+3.2 Components Needed
+    - Expression base class (template)
+    - UnaryExpr: represents unary operations (sin, cos, exp, etc.)
+    - BinaryExpr: represents binary operations (+, -, *, /)
+    - Functor classes: encapsulate derivative rules for each operation
+
+3.3 How It Works
+    - Expressions build a compile-time tree
+    - Evaluation deferred until assignment to AReal
+    - Single tape recording for entire expression
+
+--------------------------------------------------------------------------------
+4. OPERATOR OVERLOADING
+--------------------------------------------------------------------------------
+
+4.1 Arithmetic Operators
+    - Overload: +, -, *, /, unary -, unary +
+    - Handle: AReal op AReal, AReal op scalar, scalar op AReal
+
+4.2 Comparison Operators
+    - Overload: ==, !=, <, >, <=, >=
+    - Compare underlying values (no derivatives for comparisons)
+
+4.3 Assignment Operators
+    - Overload: =, +=, -=, *=, /=
+    - Must record to tape when assigning
+
+4.4 Mathematical Functions
+    - Override all std:: math functions: sin, cos, tan, asin, acos, atan
+    - exp, log, log10, log2, sqrt, cbrt, pow
+    - sinh, cosh, tanh, asinh, acosh, atanh
+    - erf, erfc, abs, fabs, ceil, floor, fmod
+    - atan2, hypot, fmin, fmax
+
+--------------------------------------------------------------------------------
+5. TAPE OPERATIONS (API)
+--------------------------------------------------------------------------------
+
+5.1 Essential Methods
+    - registerInput(x): Mark variable as independent (input)
+    - registerOutput(y): Mark variable as dependent (output)
+    - newRecording(): Start fresh tape recording
+    - computeAdjoints(): Execute backward pass
+    - clearDerivatives(): Reset all adjoints for new computation
+    - getPosition(): Get current tape position
+    - resetTo(position): Partial tape reset
+
+5.2 Thread Safety
+    - Thread-local active tape pointer
+    - Mutex protection for tape activation
+    - One tape per thread model
+
+--------------------------------------------------------------------------------
+6. CHECKPOINTING SYSTEM
+--------------------------------------------------------------------------------
+
+6.1 Purpose
+    - Long computations can exhaust memory storing tape
+    - Trade memory for recomputation time
+
+6.2 Implementation
+    - Save intermediate states at checkpoints
+    - During backward pass: recompute forward from checkpoint
+    - Nested tape recording for recomputation
+
+6.3 Checkpoint Callback Interface
+    - Virtual method: computeAdjoint(tape)
+    - User implements: save state, recompute forward, propagate adjoints
+
+--------------------------------------------------------------------------------
+7. HIGHER-ORDER DERIVATIVES
+--------------------------------------------------------------------------------
+
+7.1 Nested AD Types
+    - AReal<FReal<double>>: Forward-over-Adjoint (Hessian-vector products)
+    - FReal<FReal<double>>: Forward-over-Forward (diagonal Hessian)
+    - AReal<AReal<double>>: Adjoint-over-Adjoint (full Hessian, expensive)
+
+7.2 Jacobian Computation
+    - Matrix of first derivatives: ∂y_i/∂x_j
+    - Use multiple forward passes or single adjoint pass per output
+
+7.3 Hessian Computation
+    - Matrix of second derivatives: ∂²y/∂x_i∂x_j
+    - Forward-over-adjoint most efficient for symmetric Hessians
+
+--------------------------------------------------------------------------------
+8. PERFORMANCE OPTIMIZATIONS
+--------------------------------------------------------------------------------
+
+8.1 Compile-Time Optimizations
+    - Expression templates (avoid temporaries)
+    - Inlining (XAD_INLINE, XAD_FORCE_INLINE macros)
+    - Compile-time type traits
+
+8.2 Memory Optimizations
+    - Chunked allocation (avoid reallocations)
+    - Aligned memory (cache line efficiency: 128 bytes)
+    - Slot reuse (reclaim slots from dead variables)
+
+8.3 Computation Optimizations
+    - Result-based derivatives: e.g., d(exp(x))/dx = exp(x) = cached_result
+    - Lazy evaluation via expression templates
+    - SIMD vectorization where possible
+
+--------------------------------------------------------------------------------
+9. EXCEPTION SAFETY & ERROR HANDLING
+--------------------------------------------------------------------------------
+
+9.1 RAII Patterns
+    - ScopedNestedRecording: automatic cleanup of nested tapes
+    - ScopedTapeActivation: ensure tape deactivation on scope exit
+
+9.2 Custom Exceptions
+    - TapeAlreadyActive: attempting to activate second tape
+    - OutOfRange: invalid tape slot access
+    - DerivativesNotInitialized: accessing uninitialized adjoints
+
+9.3 Strong Exception Guarantee
+    - No tape corruption on exception
+    - Safe unwinding of nested recordings
+
+--------------------------------------------------------------------------------
+10. TESTING REQUIREMENTS
+--------------------------------------------------------------------------------
+
+10.1 Correctness Testing
+    - Finite difference validation: |AD - FD| < tolerance
+    - Symbolic verification: compare with hand-computed derivatives
+    - Roundtrip tests: forward→adjoint→forward consistency
+
+10.2 Test Coverage
+    - All operators: +, -, *, /, comparisons
+    - All math functions: trig, exp/log, special functions
+    - Edge cases: zero, infinity, NaN, very large/small values
+    - Higher-order derivatives
+    - Checkpointing correctness
+
+10.3 Performance Testing
+    - Memory leak detection (Valgrind, AddressSanitizer)
+    - Thread safety tests (concurrent tape operations)
+    - Benchmark against finite differences
+
+--------------------------------------------------------------------------------
+11. OPTIONAL BUT RECOMMENDED FEATURES
+--------------------------------------------------------------------------------
+
+11.1 Complex Number Support
+    - AD-enabled std::complex equivalent
+    - Complex-aware derivative propagation
+    - ~2700 lines in XAD (significant effort)
+
+11.2 Vector Mode (Multiple Derivatives)
+    - Compute derivatives w.r.t. multiple inputs simultaneously
+    - Vec<N> type for SIMD-friendly multi-derivative storage
+
+11.3 External Function Interface
+    - Integrate with external libraries (BLAS, LAPACK)
+    - Manual adjoint specification for non-AD code
+
+11.4 Eigen Integration
+    - Support for Eigen matrix operations with AD types
+    - Linear algebra with automatic differentiation
+
+--------------------------------------------------------------------------------
+12. IMPLEMENTATION EFFORT ESTIMATE
+--------------------------------------------------------------------------------
+
+Component                    Lines of Code    Priority
+---------------------------------------------------------
+Tape (Core)                      ~800          P0 (Must have)
+Active Types (AReal/FReal)       ~500          P0
+Operator Overloading             ~300          P0
+Math Function Derivatives        ~500          P0
+Expression Templates             ~400          P0
+ChunkContainer                   ~400          P1 (Important)
+Checkpointing                    ~200          P1
+Jacobian/Hessian Utilities       ~350          P2 (Nice to have)
+Complex Numbers                  ~2700         P2
+Vec (Multi-derivatives)          ~200          P2
+---------------------------------------------------------
+TOTAL CORE (P0)                  ~2500 lines
+TOTAL WITH P1                    ~3100 lines
+TOTAL ALL FEATURES               ~6500 lines
+
+Estimated Timeline:
+- Phase 1 (4-6 weeks): Basic forward/adjoint with +,-,*,/
+- Phase 2 (3-4 weeks): Full math function library
+- Phase 3 (3-4 weeks): Expression templates optimization
+- Phase 4 (2-3 weeks): Checkpointing & memory optimization
+- Phase 5 (4-6 weeks): Testing & production hardening
+TOTAL: 16-23 weeks for production-ready library
+
+--------------------------------------------------------------------------------
+13. FILE STRUCTURE RECOMMENDATION
+--------------------------------------------------------------------------------
+
+src/
+├── Core/
+│   ├── Expression.hpp       # Expression base template (CRTP)
+│   ├── Traits.hpp           # Type traits & metaprogramming
+│   └── Macros.hpp           # Platform macros (XAD_INLINE, etc.)
+├── Types/
+│   ├── AReal.hpp            # Adjoint Real type
+│   ├── FReal.hpp            # Forward Real type
+│   └── Vec.hpp              # Multi-derivative vector
+├── Tape/
+│   ├── Tape.hpp             # Tape declaration
+│   ├── Tape.cpp             # Tape implementation
+│   ├── ChunkContainer.hpp   # Chunked memory storage
+│   └── Checkpoint.hpp       # Checkpointing interface
+├── Expressions/
+│   ├── UnaryExpr.hpp        # Unary expression template
+│   ├── BinaryExpr.hpp       # Binary expression template
+│   ├── UnaryFunctors.hpp    # Unary derivative rules
+│   └── BinaryFunctors.hpp   # Binary derivative rules
+├── Math/
+│   └── MathFunctions.hpp    # Math function overloads
+├── Advanced/
+│   ├── Jacobian.hpp         # Jacobian computation
+│   ├── Hessian.hpp          # Hessian computation
+│   └── Complex.hpp          # Complex number support
+└── XAD.hpp                  # Master include file
+
+================================================================================
+                              END OF REQUIREMENTS
+================================================================================
