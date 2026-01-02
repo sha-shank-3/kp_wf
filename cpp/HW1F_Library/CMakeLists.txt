@@ -85,6 +85,13 @@ if(XAD_LIBRARY)
     target_link_libraries(multi_swaption_comparison PRIVATE ${XAD_LIBRARY})
 endif()
 
+# Swaption comparison app (Analytical vs MC vs MC+XAD for pricing, Analytical vs FD vs XAD+IFT for Greeks)
+add_executable(swaption_comparison apps/swaption_comparison.cpp)
+target_link_libraries(swaption_comparison PRIVATE hw1f_lib)
+if(XAD_LIBRARY)
+    target_link_libraries(swaption_comparison PRIVATE ${XAD_LIBRARY})
+endif()
+
 # ========================================
 # Refactored Components (Production Quality)
 # ========================================
